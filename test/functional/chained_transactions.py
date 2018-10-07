@@ -2,7 +2,7 @@
 # Copyright (c) 2018 Nobody
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test descendant package tracking code."""
+"""Test perforance of descendant package (chained transactions)"""
 import time
 import copy
 from test_framework.test_framework import BitcoinTestFramework
@@ -23,6 +23,7 @@ MAX_DESCENDANTS = CHAINED_TX
 class ChainedTest(BitcoinTestFramework):
 
     def set_test_params(self):
+        ''' our test network requires a peer node so that getblocktemplate succeeds '''
         self.num_nodes = 2
         chained_args = ["-limitancestorcount=5000", "-limitdescendantcount=5000",
                         "-limitancestorsize=1000", "-limitdescendantsize=1000"
@@ -54,73 +55,85 @@ class ChainedTest(BitcoinTestFramework):
         assert(len(fulltx['vout']) == num_outputs)
         return (txid, send_value, sendtx_stop - sendtx_start, fulltx['size'])
 
-    def run_test(self):
-        self.log.info('Starting Test with {0} Chained Transactions'.format(CHAINED_TX))
-
+    def mine_blocks(self):
         ''' Mine some blocks and have them mature. '''
         self.nodes[0].generate(101)
-        utxo = self.nodes[0].listunspent(10)
-        txid = utxo[0]['txid']
-        vout = utxo[0]['vout']
-        value = utxo[0]['amount']
-        fee = Decimal("0.0001")
-
+        self.utxo = self.nodes[0].listunspent(10)
+        self.txid = self.utxo[0]['txid']
+        self.vout = self.utxo[0]['vout']
+        self.value = self.utxo[0]['amount']
+        self.fee = Decimal("0.0001")
         self.tip = int("0x" + self.nodes[0].getbestblockhash(), 0)
         self.block_time = int(time.time()) + 1
 
-        # MAX_ANCESTORS transactions off a confirmed tx should be fine
-        mempool_send = 0
-        mempool_size = 0
-        chain = []
+    def send_chain_to_node(self):
+        ''' Generates tx chain and send it to node '''
         for i in range(CHAINED_TX):
-            (txid, sent_value, this_sendtx, tx_size) = self.chain_transaction(
-                self.nodes[0], txid, 0, value, fee, 1)
-            value = sent_value
-            chain.append(txid)
-            mempool_send += this_sendtx
-            mempool_size += tx_size
+            (sent_txid, sent_value, this_sendtx, tx_size) = self.chain_transaction(
+                self.nodes[0], self.txid, 0, self.value, self.fee, 1)
+            self.txid = sent_txid
+            self.value = sent_value
+            self.chain.append(self.txid)
+            self.mempool_send += this_sendtx
+            self.mempool_size += tx_size
 
-        '''
-        Create a new block with an anyone-can-spend coinbase
-        '''
-        height = 1
+    def create_new_block(self):
+        ''' Create a new block with an anyone-can-spend coinbase '''
         block = create_block(
-            self.tip, create_coinbase(height), self.block_time)
+            self.tip, create_coinbase(self.height), self.block_time)
         self.block_time += 1
         block.solve()
-        # Save the coinbase for later
-        self.block1 = block
-        self.tip = block.sha256
-        height += 1
+        return block
 
-        '''
-        Now we need that block to mature so we can spend the coinbase.
-        '''
+    def mempool_count(self):
+        ''' get count of tx in mempool '''
+        mininginfo = self.nodes[0].getmininginfo()
+        return mininginfo['pooledtx']
+
+    def run_test(self):
+        self.log.info('Starting Test with {0} Chained Transactions'.format(CHAINED_TX))
+
+        self.mine_blocks()
+
+        self.mempool_send = 0
+        self.mempool_size = 0
+        self.chain = []
+
+        self.send_chain_to_node()
+        # mempool should have all our tx
+        assert(self.mempool_count() == CHAINED_TX)
+
+        self.height = 1
+
+        # create new block and save coinbase
+        self.block1 = self.create_new_block()
+        self.tip = self.block1.sha256
+        self.height += 1
+
+        #mature the block so we can spend the coinbase
         for i in range(100):
-            block = create_block(
-                self.tip, create_coinbase(height), self.block_time)
-            block.solve()
+            block = self.create_new_block()
             self.tip = block.sha256
-            self.block_time += 1
-            height += 1
+            self.height += 1
 
-        block2 = create_block(
-            self.tip, create_coinbase(height), self.block_time)
-        self.block_time += 1
+        #block2 = create_new_block()
 
-        #assert templat.txcount == CHAINED_TX
-
-        runs=[]
+        self.runs=[]
         for test_iteration in range(TEST_ITERATIONS):
             gbt_start = time.perf_counter()
-            #validate the block
+            # assemble a block and validate all tx in it
             templat = self.nodes[0].getblocktemplate()
             gbt_stop = time.perf_counter()
-            runs.append(gbt_stop - gbt_start)
+            assert(len(templat['transactions']) == CHAINED_TX)
+            self.runs.append(gbt_stop - gbt_start)
 
-        self.log.info('Mempool size {0}'.format(mempool_size))
-        self.log.info('Send Tx took {0:.5f}s'.format(mempool_send))
-        self.log.info('GetBlkT took {0:.5f}s'.format(sum(runs)/len(runs)))
+        #assert(self.mempool_count() == 0)
+
+        self.log.info('Mempool size {0}'.format(self.mempool_size))
+        self.log.info('Send Tx took {0:.5f}s'.format(self.mempool_send))
+        if len(self.runs) > 1:
+            self.log.info('run times {}'.format(self.runs))
+        self.log.info('GetBlkT took {0:.5f}s'.format(sum(self.runs)/len(self.runs)))
 
 if __name__ == '__main__':
     ChainedTest().main()
