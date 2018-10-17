@@ -17,18 +17,26 @@ if len(sys.argv)>1:
 TEST_ITERATIONS = 1
 if len(sys.argv)>2:
     TEST_ITERATIONS = int(sys.argv[2])
+DEBUG_MODE = '-printtoconsole'
+
 MAX_ANCESTORS = CHAINED_TX
 MAX_DESCENDANTS = CHAINED_TX
+
+MAGNETIC_ANOMALY_START_TIME = 2000000000
 
 class ChainedTest(BitcoinTestFramework):
 
     def set_test_params(self):
         ''' our test network requires a peer node so that getblocktemplate succeeds '''
         self.num_nodes = 2
-        chained_args = ["-limitancestorcount=5000", "-limitdescendantcount=5000",
-                        "-limitancestorsize=1000", "-limitdescendantsize=1000"
+        chained_args = ["-limitancestorcount=2000", "-limitdescendantcount=2000",
+                        "-limitancestorsize=1000", "-limitdescendantsize=1000",
+                        "-magneticanomalyactivationtime=%d" % MAGNETIC_ANOMALY_START_TIME
                        ]
-        self.extra_args = [chained_args, chained_args]
+        config_node2 = chained_args.copy()
+        if DEBUG_MODE:
+            chained_args.append(DEBUG_MODE)
+        self.extra_args = [chained_args, config_node2]
 
     # Build a transaction that spends parent_txid:vout
     # Return amount sent
@@ -43,23 +51,22 @@ class ChainedTest(BitcoinTestFramework):
 
         #measure the performance of sending the raw transaction to the node
         sendtx_start = time.perf_counter()
-        txid = node.sendrawtransaction(signedtx['hex'])
+        new_txid = node.sendrawtransaction(signedtx['hex'])
         sendtx_stop = time.perf_counter()
-        fulltx = node.getrawtransaction(txid, 1)
+        fulltx = node.getrawtransaction(new_txid, 1)
 
-        #fulltx_hex = node.getrawtransaction(txid, 0)
-        #self.log.info(fulltx_hex)
-        #self.log.info(len(fulltx_hex))
-        #sys.getsizeof(fulltx_hex)
+        #self.log.info('{0} => {1}'.format(parent_txid, fulltx['vout'][0]))
+
         # make sure we didn't generate a change output
         assert(len(fulltx['vout']) == num_outputs)
-        return (txid, send_value, sendtx_stop - sendtx_start, fulltx['size'])
+        return (new_txid, send_value, sendtx_stop - sendtx_start, fulltx['size'])
 
     def mine_blocks(self):
         ''' Mine some blocks and have them mature. '''
         self.nodes[0].generate(101)
         self.utxo = self.nodes[0].listunspent(10)
         self.txid = self.utxo[0]['txid']
+        self.coinbasetx = self.txid
         self.vout = self.utxo[0]['vout']
         self.value = self.utxo[0]['amount']
         self.fee = Decimal("0.0001")
@@ -71,9 +78,11 @@ class ChainedTest(BitcoinTestFramework):
         for i in range(CHAINED_TX):
             (sent_txid, sent_value, this_sendtx, tx_size) = self.chain_transaction(
                 self.nodes[0], self.txid, 0, self.value, self.fee, 1)
+            if not self.chain_top:
+                self.chain_top = sent_txid
             self.txid = sent_txid
             self.value = sent_value
-            self.chain.append(self.txid)
+            self.chain.append(sent_txid)
             self.mempool_send += this_sendtx
             self.mempool_size += tx_size
 
@@ -90,8 +99,19 @@ class ChainedTest(BitcoinTestFramework):
         mininginfo = self.nodes[0].getmininginfo()
         return mininginfo['pooledtx']
 
+    def dumppool(self, mempool):
+        ''' Show list of chained tx in mempool with parent(depends) '''
+        def sortdepends(e):
+            return e['descendantcount']
+        sortedlist = [[k,v] for k,v in mempool.items()]
+        sortedlist = sorted(sortedlist, key=lambda l: l[1]['descendantcount'], reverse=True)
+        for memkv in sortedlist:
+            memtx = memkv[1]
+            self.log.info('{} {} {}'.format(memkv[0], memtx['descendantcount'], memtx['depends']))
+
     def run_test(self):
         self.log.info('Starting Test with {0} Chained Transactions'.format(CHAINED_TX))
+        self.chain_top = None
 
         self.mine_blocks()
 
@@ -100,8 +120,14 @@ class ChainedTest(BitcoinTestFramework):
         self.chain = []
 
         self.send_chain_to_node()
+
         # mempool should have all our tx
         assert(self.mempool_count() == CHAINED_TX)
+        mempool = self.nodes[0].getrawmempool(True)
+        self.log.info('tx at top has {} descendants'.format(mempool[self.chain_top]["descendantcount"]))
+        assert(mempool[self.chain_top]["descendantcount"] == CHAINED_TX)
+
+        #self.dumppool(mempool)
 
         self.height = 1
 
@@ -116,14 +142,17 @@ class ChainedTest(BitcoinTestFramework):
             self.tip = block.sha256
             self.height += 1
 
-        #block2 = create_new_block()
+        #sync pool not needed as long as we are using node 0 which has all the tx we sent to it
+        #sync_mempools(self.nodes, wait=1, timeout=100)
 
         self.runs=[]
         for test_iteration in range(TEST_ITERATIONS):
+            # do not use perf_counter. use timer from -printtoconsole instead
             gbt_start = time.perf_counter()
             # assemble a block and validate all tx in it
             templat = self.nodes[0].getblocktemplate()
             gbt_stop = time.perf_counter()
+            # make sure all tx got mined
             assert(len(templat['transactions']) == CHAINED_TX)
             self.runs.append(gbt_stop - gbt_start)
 
